@@ -1,16 +1,16 @@
-# GuitarTuner
+# GuitarTuner — The Parlour Tuner
 
-A precision guitar tuner app for iOS and macOS built with SwiftUI and Tuist.
+A precision guitar tuner for iOS and macOS built with SwiftUI and Tuist, styled
+after a 19th-century parlour instrument: mahogany cabinet, engraved brass
+plaque, and a galvanometer-style needle gauge on a parchment face.
 
 ## Features
 
-- **Real-time pitch detection** using autocorrelation-based algorithm
+- **Real-time pitch detection** using the McLeod Pitch Method (NSDF), resistant to the octave errors plucked-string harmonics cause in naive autocorrelation
+- **Automatic string detection** — pluck any string and the matching brass peg lights up; no tapping or manual selection
 - **Multiple tuning presets**: Standard, Drop D, Drop C, Open G, Open D, DADGAD, Half Step Down
-- **Visual tuning meter** with cents accuracy (±1¢ precision)
-- **Per-string indicators** showing target frequency and tuning status
-- **Calibration adjustment** (A4 = 415-466 Hz)
+- **Needle gauge** reading ±50 cents, with plain-language advice ("Wind the string tighter")
 - **Microphone-based input** with permission handling
-- **Dark mode optimized** UI with gradient accents
 - **Shared SwiftUI codebase** for iOS and macOS
 
 ## Requirements
@@ -25,13 +25,11 @@ A precision guitar tuner app for iOS and macOS built with SwiftUI and Tuist.
 
 ```
 GuitarTuner/
-├── Tuist/                  # Tuist project configuration
-│   ├── Config.swift        # Tuist config (Xcode version, Swift version)
-│   └── Project.swift       # Project definition (targets, schemes, settings)
-├── Shared/                 # Shared SwiftUI code (framework target)
+├── Tuist.swift             # Tuist config (Xcode version, Swift version)
+├── Project.swift           # Project definition (targets, schemes, settings)
+├── Shared/                 # Shared SwiftUI code
 │   └── Sources/
-│       ├── GuitarTunerShared.swift  # Models, tuner engine, pitch detector
-│       └── TunerView.swift          # Main UI views
+│       └── GuitarTunerShared.swift  # Models, tuner engine, pitch detector, UI
 ├── MacApp/                 # macOS app target
 │   ├── Sources/
 │   │   └── GuitarTunerMacApp.swift  # macOS app entry point
@@ -126,9 +124,10 @@ It builds both macOS and iOS schemes in parallel, archives signed builds when se
 The core logic lives in a shared framework target used by both apps:
 
 - **Models**: `GuitarString`, `TuningPreset`
-- **Audio Engine**: `TunerEngine` (AVAudioEngine + pitch detection)
-- **Pitch Detection**: Autocorrelation with parabolic interpolation
-- **UI**: `TunerView`, `TuningMeterView`, `StringSelectorView`, `TuningPickerView`
+- **Audio Engine**: `TunerEngine` (AVAudioEngine tap → pitch detection → smoothed, briefly-held readings)
+- **Pitch Detection**: `PitchDetector` — McLeod Pitch Method with parabolic interpolation
+- **View Model**: `TunerViewModel` — maps the detected pitch onto the nearest string of the selected tuning
+- **UI**: `TunerView`, `ParlourGaugeView`, `StringPegsView`, `TuningPickerView`
 
 ### App Targets
 
@@ -139,15 +138,18 @@ Both apps share 100% of the UI and logic through the framework.
 
 ## Pitch Detection Algorithm
 
-The `PitchDetector` class uses autocorrelation with Hanning window:
+The `PitchDetector` class implements the McLeod Pitch Method:
 
-1. Apply Hanning window to audio buffer
-2. Compute autocorrelation for lags corresponding to 50-500 Hz
-3. Find peak correlation lag
-4. Parabolic interpolation for sub-sample accuracy
-5. Convert lag to frequency: `f = sampleRate / lag`
+1. Gate on RMS amplitude to ignore background noise
+2. Compute the normalized square difference function (NSDF) for lags corresponding to 55–500 Hz, using vDSP and prefix sums
+3. Pick key maxima between zero crossings; take the first maximum above 90% of the global peak (this is what avoids octave errors)
+4. Reject unclear signals (peak NSDF below 0.82)
+5. Parabolic interpolation for sub-sample accuracy, then `f = sampleRate / lag`
 
-Accuracy: ±1 cent for typical guitar frequencies (82-330 Hz).
+The detector runs at the actual hardware sample rate reported by the input
+node — assuming 44.1 kHz on 48 kHz hardware would read ~9% sharp. Readings are
+median-smoothed over recent buffers and held briefly between plucks so the
+needle doesn't flicker.
 
 ## License
 

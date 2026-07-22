@@ -2,9 +2,13 @@
 //  GuitarTunerShared.swift
 //  Shared SwiftUI views and models for GuitarTuner
 //
+//  Styled after a 19th-century parlour instrument: mahogany, brass and
+//  a galvanometer-style needle gauge.
+//
 
 import SwiftUI
 import Combine
+import Accelerate
 import AVFoundation
 
 // MARK: - Tuning Model
@@ -15,23 +19,14 @@ struct GuitarString: Identifiable, Hashable {
     let note: String
     let frequency: Double
     let stringNumber: Int
-    
+
     static let standardTuning: [GuitarString] = [
         GuitarString(note: "E", frequency: 82.41, stringNumber: 6),   // Low E
-        GuitarString(note: "A", frequency: 110.00, stringNumber: 5),  // A
-        GuitarString(note: "D", frequency: 146.83, stringNumber: 4),  // D
-        GuitarString(note: "G", frequency: 196.00, stringNumber: 3),  // G
-        GuitarString(note: "B", frequency: 246.94, stringNumber: 2),  // B
-        GuitarString(note: "E", frequency: 329.63, stringNumber: 1),  // High E
-    ]
-    
-    static let dropD: [GuitarString] = [
-        GuitarString(note: "D", frequency: 73.42, stringNumber: 6),
         GuitarString(note: "A", frequency: 110.00, stringNumber: 5),
         GuitarString(note: "D", frequency: 146.83, stringNumber: 4),
         GuitarString(note: "G", frequency: 196.00, stringNumber: 3),
         GuitarString(note: "B", frequency: 246.94, stringNumber: 2),
-        GuitarString(note: "E", frequency: 329.63, stringNumber: 1),
+        GuitarString(note: "E", frequency: 329.63, stringNumber: 1),  // High E
     ]
 }
 
@@ -44,13 +39,20 @@ enum TuningPreset: String, CaseIterable, Identifiable {
     case openD = "Open D (DADF#AD)"
     case dadgad = "DADGAD"
     case halfStepDown = "Half Step Down (Eb Ab Db Gb Bb Eb)"
-    
+
     var id: String { rawValue }
-    
+
     var strings: [GuitarString] {
         switch self {
         case .standard: return GuitarString.standardTuning
-        case .dropD: return GuitarString.dropD
+        case .dropD: return [
+            GuitarString(note: "D", frequency: 73.42, stringNumber: 6),
+            GuitarString(note: "A", frequency: 110.00, stringNumber: 5),
+            GuitarString(note: "D", frequency: 146.83, stringNumber: 4),
+            GuitarString(note: "G", frequency: 196.00, stringNumber: 3),
+            GuitarString(note: "B", frequency: 246.94, stringNumber: 2),
+            GuitarString(note: "E", frequency: 329.63, stringNumber: 1),
+        ]
         case .dropC: return [
             GuitarString(note: "C", frequency: 65.41, stringNumber: 6),
             GuitarString(note: "G", frequency: 98.00, stringNumber: 5),
@@ -95,16 +97,137 @@ enum TuningPreset: String, CaseIterable, Identifiable {
     }
 }
 
-// MARK: - Tuner Engine
+// MARK: - Pitch Detector (McLeod Pitch Method)
 
-/// Protocol for audio input and pitch detection
-protocol TunerEngineDelegate: AnyObject {
-    func tunerEngine(_ engine: TunerEngine, didDetectPitch frequency: Double, amplitude: Float)
-    func tunerEngine(_ engine: TunerEngine, didUpdateState state: TunerEngine.State)
-    func tunerEngine(_ engine: TunerEngine, didEncounterError error: Error)
+/// Result of analysing one audio buffer. Safe to pass across threads.
+struct PitchReading {
+    let frequency: Double?  // nil when no confident pitch was found
+    let amplitude: Float
 }
 
-/// Audio engine for real-time pitch detection using AVAudioEngine
+/// Pitch detector using the McLeod Pitch Method (normalized square
+/// difference function + key-maximum picking). Far more resistant to
+/// octave errors than raw autocorrelation, which matters for the strong
+/// harmonics of plucked strings.
+///
+/// All methods are called on the audio render thread only.
+final class PitchDetector {
+    private let sampleRate: Double
+    private let minFrequency: Double
+    private let maxFrequency: Double
+    private let minAmplitude: Float
+    private let clarityThreshold: Float = 0.82
+
+    private var samples: [Float]
+
+    init(sampleRate: Double,
+         minFrequency: Double = 55.0,
+         maxFrequency: Double = 500.0,
+         minAmplitude: Float = 0.015) {
+        self.sampleRate = sampleRate
+        self.minFrequency = minFrequency
+        self.maxFrequency = maxFrequency
+        self.minAmplitude = minAmplitude
+        self.samples = []
+    }
+
+    func process(buffer: AVAudioPCMBuffer) -> PitchReading {
+        guard let channelData = buffer.floatChannelData?[0] else {
+            return PitchReading(frequency: nil, amplitude: 0)
+        }
+        let n = Int(buffer.frameLength)
+        guard n > 0 else { return PitchReading(frequency: nil, amplitude: 0) }
+
+        samples = Array(UnsafeBufferPointer(start: channelData, count: n))
+
+        var rms: Float = 0
+        vDSP_rmsqv(samples, 1, &rms, vDSP_Length(n))
+        guard rms > minAmplitude else {
+            return PitchReading(frequency: nil, amplitude: rms)
+        }
+
+        return PitchReading(frequency: detectPitch(), amplitude: rms)
+    }
+
+    private func detectPitch() -> Double? {
+        let n = samples.count
+        let minLag = max(2, Int(sampleRate / maxFrequency))
+        let maxLag = min(Int(sampleRate / minFrequency), n - 2)
+        guard maxLag > minLag else { return nil }
+
+        // Prefix sums of squared samples so m'(lag) is O(1) per lag.
+        var squared = [Float](repeating: 0, count: n)
+        vDSP_vsq(samples, 1, &squared, 1, vDSP_Length(n))
+        var prefix = [Float](repeating: 0, count: n + 1)
+        for i in 0..<n { prefix[i + 1] = prefix[i] + squared[i] }
+
+        // NSDF: n'(lag) = 2 * acf(lag) / (energy(0..n-lag) + energy(lag..n))
+        var nsdf = [Float](repeating: 0, count: maxLag + 1)
+        samples.withUnsafeBufferPointer { ptr in
+            guard let base = ptr.baseAddress else { return }
+            for lag in minLag...maxLag {
+                var acf: Float = 0
+                vDSP_dotpr(base, 1, base + lag, 1, &acf, vDSP_Length(n - lag))
+                let m = (prefix[n - lag] - prefix[0]) + (prefix[n] - prefix[lag])
+                nsdf[lag] = m > 0 ? 2 * acf / m : 0
+            }
+        }
+
+        // Key maximum picking: collect the highest point of each region
+        // between positive-going and negative-going zero crossings.
+        var keyMaxima: [(lag: Int, value: Float)] = []
+        var inPeak = false
+        var peakLag = 0
+        var peakValue: Float = 0
+        for lag in minLag...maxLag {
+            let value = nsdf[lag]
+            if value > 0 {
+                if !inPeak {
+                    inPeak = true
+                    peakLag = lag
+                    peakValue = value
+                } else if value > peakValue {
+                    peakValue = value
+                    peakLag = lag
+                }
+            } else if inPeak {
+                inPeak = false
+                keyMaxima.append((peakLag, peakValue))
+            }
+        }
+        if inPeak { keyMaxima.append((peakLag, peakValue)) }
+        guard let highest = keyMaxima.map(\.value).max(),
+              highest >= clarityThreshold else { return nil }
+
+        // First key maximum above k * highest is the fundamental.
+        let threshold = highest * 0.9
+        guard let chosen = keyMaxima.first(where: { $0.value >= threshold }) else { return nil }
+
+        // Parabolic interpolation around the chosen lag.
+        let lag = chosen.lag
+        var refinedLag = Double(lag)
+        if lag > minLag && lag < maxLag {
+            let y1 = Double(nsdf[lag - 1])
+            let y2 = Double(nsdf[lag])
+            let y3 = Double(nsdf[lag + 1])
+            let denominator = 2 * (2 * y2 - y1 - y3)
+            if abs(denominator) > 1e-9 {
+                refinedLag += (y3 - y1) / denominator
+            }
+        }
+        guard refinedLag > 0 else { return nil }
+
+        let frequency = sampleRate / refinedLag
+        guard frequency >= minFrequency && frequency <= maxFrequency else { return nil }
+        return frequency
+    }
+}
+
+// MARK: - Tuner Engine
+
+/// Audio engine for real-time pitch detection using AVAudioEngine.
+/// Publishes a smoothed, briefly-held pitch so the display doesn't
+/// flicker between buffers.
 @MainActor
 final class TunerEngine: ObservableObject {
     enum State: Equatable {
@@ -113,315 +236,190 @@ final class TunerEngine: ObservableObject {
         case listening
         case error(String)
     }
-    
+
     @Published private(set) var state: State = .idle
     @Published private(set) var detectedFrequency: Double = 0
     @Published private(set) var amplitude: Float = 0
-    @Published private(set) var closestNote: String = "--"
-    @Published private(set) var centsOff: Double = 0
-    @Published private(set) var isInTune: Bool = false
-    
-    weak var delegate: TunerEngineDelegate?
-    
+
     private var audioEngine: AVAudioEngine?
     private var inputNode: AVAudioInputNode?
-    private var pitchDetector: PitchDetector?
-    
-    // Audio settings
-    private let sampleRate: Double = 44100
+
     private let bufferSize: AVAudioFrameCount = 4096
-    
-    // Pitch detection parameters
-    private let minFrequency: Double = 50.0
-    private let maxFrequency: Double = 500.0
-    private let minAmplitude: Float = 0.02
-    
-    // Reference A4 = 440Hz
-    private let a4Frequency: Double = 440.0
-    
-    init() {
-        setupAudioSession()
-    }
-    
+
+    // Smoothing over recent readings, plus a short hold after silence.
+    private var recentFrequencies: [Double] = []
+    private var lastPitchDate: Date = .distantPast
+    private let holdInterval: TimeInterval = 0.9
+
     deinit {
-        stopListening()
+        // Tear down audio directly; stopListening() is main-actor isolated and
+        // can't be called from the nonisolated deinit.
+        audioEngine?.stop()
+        inputNode?.removeTap(onBus: 0)
     }
-    
-    private func setupAudioSession() {
-        #if os(iOS)
-        let session = AVAudioSession.sharedInstance()
-        do {
-            try session.setCategory(.record, mode: .measurement, options: [.duckOthers, .allowBluetooth])
-            try session.setActive(true)
-        } catch {
-            state = .error("Audio session setup failed: \(error.localizedDescription)")
-            delegate?.tunerEngine(self, didEncounterError: error)
-        }
-        #elseif os(macOS)
-        // macOS doesn't require explicit audio session setup
-        #endif
-    }
-    
+
     func startListening() {
-        guard state != .listening else { return }
-        
+        guard state != .listening && state != .requestingPermission else { return }
+
         #if os(iOS)
+        state = .requestingPermission
         AVAudioSession.sharedInstance().requestRecordPermission { [weak self] granted in
             Task { @MainActor in
+                guard let self else { return }
                 if granted {
-                    self?.startAudioEngine()
+                    self.startAudioEngine()
                 } else {
-                    self?.state = .error("Microphone permission denied")
-                    self?.delegate?.tunerEngine(self!, didEncounterError: NSError(domain: "TunerEngine", code: 1, userInfo: [NSLocalizedDescriptionKey: "Microphone permission denied"]))
+                    self.state = .error("Microphone permission denied")
                 }
             }
         }
-        state = .requestingPermission
         #elseif os(macOS)
         startAudioEngine()
         #endif
     }
-    
+
     private func startAudioEngine() {
-        audioEngine = AVAudioEngine()
-        inputNode = audioEngine?.inputNode
-        
-        guard let audioEngine = audioEngine,
-              let inputNode = inputNode else {
-            state = .error("Failed to create audio engine")
+        #if os(iOS)
+        do {
+            let session = AVAudioSession.sharedInstance()
+            try session.setCategory(.record, mode: .measurement, options: [.duckOthers, .allowBluetoothHFP])
+            try session.setActive(true)
+        } catch {
+            state = .error("Audio session setup failed: \(error.localizedDescription)")
             return
         }
-        
-        let format = inputNode.outputFormat(forBus: 0)
-        
-        pitchDetector = PitchDetector(sampleRate: sampleRate, bufferSize: bufferSize)
-        
-        inputNode.installTap(onBus: 0, bufferSize: bufferSize, format: format) { [weak self] buffer, time in
-            self?.processAudioBuffer(buffer)
+        #endif
+
+        let engine = AVAudioEngine()
+        let input = engine.inputNode
+        let format = input.outputFormat(forBus: 0)
+        guard format.sampleRate > 0 else {
+            state = .error("No audio input available")
+            return
         }
-        
-        audioEngine.prepare()
-        
+
+        // The detector must use the hardware sample rate, not an assumed
+        // one — a 44.1k assumption on 48k hardware reads ~9% sharp.
+        let detector = PitchDetector(sampleRate: format.sampleRate)
+
+        input.installTap(onBus: 0, bufferSize: bufferSize, format: format) { [weak self] buffer, _ in
+            let reading = detector.process(buffer: buffer)
+            DispatchQueue.main.async {
+                self?.apply(reading)
+            }
+        }
+
+        engine.prepare()
         do {
-            try audioEngine.start()
+            try engine.start()
+            audioEngine = engine
+            inputNode = input
             state = .listening
-            delegate?.tunerEngine(self, didUpdateState: .listening)
         } catch {
+            input.removeTap(onBus: 0)
             state = .error("Failed to start audio engine: \(error.localizedDescription)")
-            delegate?.tunerEngine(self, didEncounterError: error)
         }
     }
-    
+
     func stopListening() {
         audioEngine?.stop()
         inputNode?.removeTap(onBus: 0)
         audioEngine = nil
         inputNode = nil
-        pitchDetector = nil
-        
+
         detectedFrequency = 0
         amplitude = 0
-        closestNote = "--"
-        centsOff = 0
-        isInTune = false
-        
+        recentFrequencies = []
+        lastPitchDate = .distantPast
+
         if state != .idle {
             state = .idle
-            delegate?.tunerEngine(self, didUpdateState: .idle)
         }
     }
-    
-    private func processAudioBuffer(_ buffer: AVAudioPCMBuffer) {
-        guard let pitchDetector = pitchDetector,
-              let channelData = buffer.floatChannelData?[0] else { return }
-        
-        let frameLength = Int(buffer.frameLength)
-        let amplitude = calculateRMS(channelData, frameLength: frameLength)
-        
-        guard amplitude > minAmplitude else {
-            DispatchQueue.main.async { [weak self] in
-                self?.amplitude = amplitude
-                self?.detectedFrequency = 0
-                self?.closestNote = "--"
-                self?.centsOff = 0
-                self?.isInTune = false
+
+    private func apply(_ reading: PitchReading) {
+        guard state == .listening else { return }
+        amplitude = reading.amplitude
+
+        guard let frequency = reading.frequency else {
+            // Hold the last reading briefly so the needle doesn't snap
+            // to zero between plucks.
+            if Date().timeIntervalSince(lastPitchDate) > holdInterval {
+                detectedFrequency = 0
+                recentFrequencies = []
             }
             return
         }
-        
-        let frequency = pitchDetector.detectPitch(channelData, frameLength: frameLength)
-        
-        guard frequency >= minFrequency && frequency <= maxFrequency else {
-            DispatchQueue.main.async { [weak self] in
-                self?.amplitude = amplitude
-            }
-            return
-        }
-        
-        let (note, cents) = frequencyToNote(frequency)
-        let inTune = abs(cents) < 5.0 // Within 5 cents is "in tune"
-        
-        DispatchQueue.main.async { [weak self] in
-            self?.detectedFrequency = frequency
-            self?.amplitude = amplitude
-            self?.closestNote = note
-            self?.centsOff = cents
-            self?.isInTune = inTune
-            self?.delegate?.tunerEngine(self!, didDetectPitch: frequency, amplitude: amplitude)
-        }
-    }
-    
-    private func calculateRMS(_ data: UnsafeMutablePointer<Float>, frameLength: Int) -> Float {
-        var sum: Float = 0
-        for i in 0..<frameLength {
-            sum += data[i] * data[i]
-        }
-        return sqrt(sum / Float(frameLength))
-    }
-    
-    private func frequencyToNote(_ frequency: Double) -> (String, Double) {
-        // A4 = 440Hz = MIDI note 69
-        let midiNote = 69 + 12 * log2(frequency / a4Frequency)
-        let roundedMidiNote = round(midiNote)
-        let centsOff = (midiNote - roundedMidiNote) * 100
-        
-        let noteNames = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
-        let noteIndex = Int(roundedMidiNote) % 12
-        let octave = Int(roundedMidiNote) / 12 - 1
-        
-        let noteName = "\(noteNames[noteIndex])\(octave)"
-        return (noteName, centsOff)
-    }
-    
-    // Get the target frequency for a given string
-    func targetFrequency(for string: GuitarString) -> Double {
-        return string.frequency
-    }
-    
-    // Calculate cents difference from target
-    func centsFromTarget(_ targetFrequency: Double) -> Double {
-        guard detectedFrequency > 0 else { return 0 }
-        return 1200 * log2(detectedFrequency / targetFrequency)
-    }
-}
 
-// MARK: - Pitch Detector (Autocorrelation-based)
+        lastPitchDate = Date()
 
-/// Simple autocorrelation-based pitch detector
-final class PitchDetector {
-    private let sampleRate: Double
-    private let bufferSize: Int
-    private var buffer: [Float]
-    
-    init(sampleRate: Double, bufferSize: Int) {
-        self.sampleRate = sampleRate
-        self.bufferSize = bufferSize
-        self.buffer = Array(repeating: 0, count: bufferSize)
-    }
-    
-    func detectPitch(_ data: UnsafeMutablePointer<Float>, frameLength: Int) -> Double {
-        // Copy data to buffer
-        for i in 0..<min(frameLength, bufferSize) {
-            buffer[i] = data[i]
+        // If the note jumped (new string plucked), restart smoothing.
+        if let last = recentFrequencies.last, abs(frequency - last) / last > 0.06 {
+            recentFrequencies = []
         }
-        
-        // Apply window function (Hanning)
-        for i in 0..<bufferSize {
-            let window = 0.5 * (1 - cos(2 * Double.pi * Double(i) / Double(bufferSize - 1)))
-            buffer[i] *= Float(window)
-        }
-        
-        // Autocorrelation
-        var maxCorrelation: Float = 0
-        var bestLag = 0
-        
-        let minLag = Int(sampleRate / 500.0)  // 500 Hz max
-        let maxLag = Int(sampleRate / 50.0)   // 50 Hz min
-        
-        for lag in minLag...min(maxLag, bufferSize - 1) {
-            var correlation: Float = 0
-            let count = bufferSize - lag
-            
-            for i in 0..<count {
-                correlation += buffer[i] * buffer[i + lag]
-            }
-            
-            correlation /= Float(count)
-            
-            if correlation > maxCorrelation {
-                maxCorrelation = correlation
-                bestLag = lag
-            }
-        }
-        
-        // Parabolic interpolation for better accuracy
-        if bestLag > 0 && bestLag < bufferSize - 1 {
-            let y1 = autocorrelation(at: bestLag - 1)
-            let y2 = autocorrelation(at: bestLag)
-            let y3 = autocorrelation(at: bestLag + 1)
-            
-            let delta = (y3 - y1) / (2 * (2 * y2 - y1 - y3))
-            let interpolatedLag = Double(bestLag) + delta
-            
-            if interpolatedLag > 0 {
-                return sampleRate / interpolatedLag
-            }
-        }
-        
-        if bestLag > 0 {
-            return sampleRate / Double(bestLag)
-        }
-        
-        return 0
-    }
-    
-    private func autocorrelation(at lag: Int) -> Float {
-        guard lag < bufferSize else { return 0 }
-        var sum: Float = 0
-        let count = bufferSize - lag
-        
-        for i in 0..<count {
-            sum += buffer[i] * buffer[i + lag]
-        }
-        
-        return sum / Float(count)
+        recentFrequencies.append(frequency)
+        if recentFrequencies.count > 5 { recentFrequencies.removeFirst() }
+
+        let sorted = recentFrequencies.sorted()
+        detectedFrequency = sorted[sorted.count / 2]
     }
 }
 
 // MARK: - Tuner View Model
 
-/// View model for the tuner UI
+/// View model: maps the detected pitch onto the nearest string of the
+/// selected tuning (automatic string detection — no manual selection).
 @MainActor
 final class TunerViewModel: ObservableObject {
-    @Published var engine = TunerEngine()
+    let engine = TunerEngine()
+
     @Published var selectedTuning: TuningPreset = .standard
-    @Published var selectedStringIndex: Int = 0
-    @Published var calibration: Double = 440.0 // A4 reference
-    
-    var currentString: GuitarString {
-        selectedTuning.strings[selectedStringIndex]
+
+    private var cancellables: Set<AnyCancellable> = []
+
+    init() {
+        engine.objectWillChange
+            .sink { [weak self] _ in self?.objectWillChange.send() }
+            .store(in: &cancellables)
     }
-    
-    var strings: [GuitarString] {
-        selectedTuning.strings
+
+    var strings: [GuitarString] { selectedTuning.strings }
+
+    var hasPitch: Bool { engine.detectedFrequency > 0 }
+
+    /// Index of the string nearest to the detected pitch, or nil in silence.
+    var detectedStringIndex: Int? {
+        guard hasPitch else { return nil }
+        let frequency = engine.detectedFrequency
+        return strings.indices.min { a, b in
+            abs(log2(frequency / strings[a].frequency)) < abs(log2(frequency / strings[b].frequency))
+        }
     }
-    
+
+    var detectedString: GuitarString? {
+        detectedStringIndex.map { strings[$0] }
+    }
+
+    /// Cents deviation from the auto-detected string's target pitch.
     var centsOff: Double {
-        engine.centsFromTarget(currentString.frequency)
+        guard hasPitch, let target = detectedString else { return 0 }
+        return 1200 * log2(engine.detectedFrequency / target.frequency)
     }
-    
+
     var isInTune: Bool {
-        engine.isInTune && abs(centsOff) < 5.0
+        hasPitch && abs(centsOff) <= 5
     }
-    
+
     var isListening: Bool {
         engine.state == .listening
     }
-    
-    init() {
-        engine.delegate = self
+
+    var tuningAdvice: String {
+        guard hasPitch else { return isListening ? "Sound a string" : "At rest" }
+        if isInTune { return "In tune" }
+        return centsOff > 0 ? "Slacken the string" : "Wind the string tighter"
     }
-    
+
     func toggleListening() {
         if engine.state == .listening {
             engine.stopListening()
@@ -429,227 +427,424 @@ final class TunerViewModel: ObservableObject {
             engine.startListening()
         }
     }
-    
-    func selectString(_ index: Int) {
-        selectedStringIndex = index
-    }
-    
-    func setTuning(_ tuning: TuningPreset) {
-        selectedTuning = tuning
-    }
-    
-    func setCalibration(_ hz: Double) {
-        calibration = hz
-        engine.calibration = hz
-    }
 }
 
-extension TunerViewModel: TunerEngineDelegate {
-    func tunerEngine(_ engine: TunerEngine, didDetectPitch frequency: Double, amplitude: Float) {}
-    
-    func tunerEngine(_ engine: TunerEngine, didUpdateState state: TunerEngine.State) {
-        objectWillChange.send()
-    }
-    
-    func tunerEngine(_ engine: TunerEngine, didEncounterError error: Error) {
-        // Error handling handled by published state
-    }
+// MARK: - Parlour Palette
+
+/// Colours of a 19th-century drawing-room instrument.
+enum Parlour {
+    static let mahoganyDark = Color(red: 0.14, green: 0.08, blue: 0.05)
+    static let mahogany = Color(red: 0.24, green: 0.13, blue: 0.08)
+    static let mahoganyLight = Color(red: 0.33, green: 0.19, blue: 0.11)
+    static let brass = Color(red: 0.72, green: 0.56, blue: 0.30)
+    static let brassBright = Color(red: 0.93, green: 0.80, blue: 0.52)
+    static let brassDark = Color(red: 0.42, green: 0.30, blue: 0.14)
+    static let parchment = Color(red: 0.94, green: 0.89, blue: 0.76)
+    static let parchmentShade = Color(red: 0.85, green: 0.77, blue: 0.60)
+    static let ink = Color(red: 0.16, green: 0.13, blue: 0.10)
+    static let inkFaint = Color(red: 0.16, green: 0.13, blue: 0.10).opacity(0.55)
+    static let bluedSteel = Color(red: 0.16, green: 0.19, blue: 0.26)
+    static let lampGreen = Color(red: 0.30, green: 0.62, blue: 0.36)
+    static let lampOff = Color(red: 0.20, green: 0.26, blue: 0.20)
+
+    static let brassGradient = LinearGradient(
+        colors: [brassDark, brass, brassBright, brass, brassDark],
+        startPoint: .topLeading,
+        endPoint: .bottomTrailing
+    )
+
+    static let bezelGradient = AngularGradient(
+        colors: [brassDark, brassBright, brass, brassDark, brass, brassBright, brassDark],
+        center: .center
+    )
 }
 
-// MARK: - Color Extension
+// MARK: - Background
 
-extension Color {
-    init(hex: String) {
-        let hex = hex.trimmingCharacters(in: CharacterSet.alphanumerics.inverted)
-        var int: UInt64 = 0
-        Scanner(string: hex).scanHexInt64(&int)
-        let a, r, g, b: UInt64
-        switch hex.count {
-        case 3: // RGB (12-bit)
-            (a, r, g, b) = (255, (int >> 8) * 17, (int >> 4 & 0xF) * 17, (int & 0xF) * 17)
-        case 6: // RGB (24-bit)
-            (a, r, g, b) = (255, int >> 16, int >> 8 & 0xFF, int & 0xFF)
-        case 8: // ARGB (32-bit)
-            (a, r, g, b) = (int >> 24, int >> 16 & 0xFF, int >> 8 & 0xFF, int & 0xFF)
-        default:
-            (a, r, g, b) = (1, 1, 1, 0)
+/// Polished mahogany panel with subtle grain and a vignette.
+struct MahoganyBackground: View {
+    var body: some View {
+        ZStack {
+            LinearGradient(
+                colors: [Parlour.mahoganyLight, Parlour.mahogany, Parlour.mahoganyDark],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+
+            // Wood grain: deterministic pseudo-random wavering streaks.
+            Canvas { context, size in
+                var seed: UInt64 = 0x5EED
+                func random() -> Double {
+                    seed = seed &* 6364136223846793005 &+ 1442695040888963407
+                    return Double(seed >> 33) / Double(UInt32.max)
+                }
+                let streaks = 46
+                for i in 0..<streaks {
+                    let x = size.width * Double(i) / Double(streaks) + random() * 14 - 7
+                    var path = Path()
+                    path.move(to: CGPoint(x: x, y: -10))
+                    var y: Double = 0
+                    var drift = x
+                    while y < size.height + 10 {
+                        y += 26 + random() * 30
+                        drift += random() * 10 - 5
+                        path.addQuadCurve(
+                            to: CGPoint(x: drift, y: y),
+                            control: CGPoint(x: drift + random() * 12 - 6, y: y - 15)
+                        )
+                    }
+                    context.stroke(
+                        path,
+                        with: .color(.black.opacity(0.05 + random() * 0.07)),
+                        lineWidth: 0.7 + random() * 1.6
+                    )
+                }
+            }
+
+            RadialGradient(
+                colors: [.clear, .black.opacity(0.45)],
+                center: .center,
+                startRadius: 120,
+                endRadius: 620
+            )
         }
-        self.init(
-            .sRGB,
-            red: Double(r) / 255,
-            green: Double(g) / 255,
-            blue: Double(b) / 255,
-            opacity: Double(a) / 255
-        )
+        .ignoresSafeArea()
     }
 }
 
-// MARK: - Tuner View Components
+// MARK: - Brass Fittings
 
-/// Circular tuner display showing pitch accuracy
-struct TunerDialView: View {
+/// A small brass screw head, for fastening plaques to the cabinet.
+struct BrassScrew: View {
+    var angle: Angle = .degrees(38)
+
+    var body: some View {
+        ZStack {
+            Circle()
+                .fill(Parlour.brassGradient)
+                .overlay(Circle().stroke(Parlour.brassDark, lineWidth: 0.6))
+            Rectangle()
+                .fill(Parlour.brassDark.opacity(0.9))
+                .frame(height: 1.2)
+                .padding(.horizontal, 1.5)
+                .rotationEffect(angle)
+        }
+        .frame(width: 7, height: 7)
+        .shadow(color: .black.opacity(0.5), radius: 1, y: 1)
+    }
+}
+
+/// An engraved brass plate with screws in the corners.
+struct BrassPlaque<Content: View>: View {
+    @ViewBuilder var content: Content
+
+    var body: some View {
+        content
+            .padding(.horizontal, 22)
+            .padding(.vertical, 10)
+            .background(
+                ZStack {
+                    RoundedRectangle(cornerRadius: 6)
+                        .fill(Parlour.brassGradient)
+                    RoundedRectangle(cornerRadius: 6)
+                        .strokeBorder(Parlour.brassDark.opacity(0.8), lineWidth: 1)
+                        .padding(2.5)
+                    RoundedRectangle(cornerRadius: 6)
+                        .strokeBorder(
+                            LinearGradient(
+                                colors: [Parlour.brassBright.opacity(0.9), Parlour.brassDark],
+                                startPoint: .top,
+                                endPoint: .bottom
+                            ),
+                            lineWidth: 1.2
+                        )
+                }
+            )
+            .overlay(alignment: .topLeading) { BrassScrew(angle: .degrees(30)).padding(4) }
+            .overlay(alignment: .topTrailing) { BrassScrew(angle: .degrees(80)).padding(4) }
+            .overlay(alignment: .bottomLeading) { BrassScrew(angle: .degrees(120)).padding(4) }
+            .overlay(alignment: .bottomTrailing) { BrassScrew(angle: .degrees(55)).padding(4) }
+            .shadow(color: .black.opacity(0.55), radius: 5, y: 3)
+    }
+}
+
+// MARK: - The Gauge
+
+/// Galvanometer-style needle gauge: brass bezel, parchment face,
+/// blued-steel needle sweeping ±50 cents.
+struct ParlourGaugeView: View {
     let centsOff: Double
+    let hasPitch: Bool
     let isInTune: Bool
-    let targetNote: String
-    let detectedNote: String
-    let amplitude: Float
-    
+    let noteName: String
+    let frequency: Double
+
     private let maxCents: Double = 50
-    
+    private let sweep: Double = 55 // degrees each side of vertical
+
     var body: some View {
         GeometryReader { geometry in
             let size = min(geometry.size.width, geometry.size.height)
             let center = CGPoint(x: size / 2, y: size / 2)
-            let radius = size * 0.4
-            
+            let faceRadius = size * 0.44
+
             ZStack {
-                // Background circle
-                Circle()
-                    .stroke(Color.white.opacity(0.1), lineWidth: 4)
-                    .frame(width: radius * 2, height: radius * 2)
-                
-                // Center marker
-                Circle()
-                    .fill(isInTune ? Color.green : Color.white.opacity(0.3))
-                    .frame(width: 12, height: 12)
-                    .position(center)
-                
-                // Needle indicator
-                NeedleShape()
-                    .fill(isInTune ? Color.green : (abs(centsOff) < 15 ? Color.yellow : Color.red))
-                    .frame(width: 4, height: radius * 0.8)
-                    .offset(y: -radius * 0.4)
-                    .rotationEffect(.degrees(needleAngle))
-                    .position(center)
-                    .animation(.spring(response: 0.15, dampingFraction: 0.8), value: centsOff)
-                
-                // Center dot
-                Circle()
-                    .fill(Color.white)
-                    .frame(width: 8, height: 8)
-                    .position(center)
-                
-                // Note labels
-                VStack(spacing: 4) {
-                    Text(detectedNote)
-                        .font(.system(size: 48, weight: .bold, design: .rounded))
-                        .foregroundStyle(.white)
-                    Text(targetNote)
-                        .font(.system(size: 18, weight: .medium, design: .rounded))
-                        .foregroundStyle(.white.opacity(0.6))
-                    Text("\(centsOff >= 0 ? "+" : "")\(Int(centsOff))¢")
-                        .font(.system(size: 20, weight: .semibold, design: .rounded))
-                        .foregroundStyle(centsColor)
-                        .monospacedDigit()
-                }
-                .position(x: center.x, y: center.y + radius * 1.3)
-                
-                // Tick marks
-                ForEach(-50...50, id: \.self) { cent in
-                    if cent % 10 == 0 {
-                        TickMark(cent: cent, maxCents: maxCents, radius: radius)
-                    }
-                }
+                bezel(radius: size * 0.5, center: center)
+                face(radius: faceRadius, center: center)
+                scale(radius: faceRadius, center: center)
+                faceText(radius: faceRadius, center: center)
+                needle(radius: faceRadius, center: center)
+                hub(center: center)
             }
             .frame(width: size, height: size)
+            .position(x: geometry.size.width / 2, y: geometry.size.height / 2)
         }
         .aspectRatio(1, contentMode: .fit)
     }
-    
+
     private var needleAngle: Double {
+        guard hasPitch else { return -sweep }
         let clamped = max(-maxCents, min(maxCents, centsOff))
-        return (clamped / maxCents) * 45 // ±45 degrees
+        return (clamped / maxCents) * sweep
     }
-    
-    private var centsColor: Color {
-        if isInTune { return .green }
-        if abs(centsOff) < 15 { return .yellow }
-        return .red
+
+    private func bezel(radius: CGFloat, center: CGPoint) -> some View {
+        ZStack {
+            Circle()
+                .fill(Parlour.bezelGradient)
+                .frame(width: radius * 2, height: radius * 2)
+                .shadow(color: .black.opacity(0.6), radius: 10, y: 6)
+            Circle()
+                .stroke(Parlour.brassDark, lineWidth: 1.5)
+                .frame(width: radius * 2, height: radius * 2)
+            Circle()
+                .stroke(Parlour.brassDark.opacity(0.8), lineWidth: 2)
+                .frame(width: radius * 1.79, height: radius * 1.79)
+        }
+        .position(center)
+    }
+
+    private func face(radius: CGFloat, center: CGPoint) -> some View {
+        Circle()
+            .fill(
+                RadialGradient(
+                    colors: [Parlour.parchment, Parlour.parchmentShade],
+                    center: .center,
+                    startRadius: radius * 0.2,
+                    endRadius: radius
+                )
+            )
+            .overlay(
+                Circle().stroke(Parlour.ink.opacity(0.35), lineWidth: 1)
+            )
+            .frame(width: radius * 2, height: radius * 2)
+            .position(center)
+    }
+
+    private func scale(radius: CGFloat, center: CGPoint) -> some View {
+        let tickRadius = radius * 0.88
+        return ZStack {
+            // Arc under the ticks; trim 0.25 sits at the bottom of the
+            // circle, so rotate 180° to centre the arc at the top.
+            Circle()
+                .trim(from: 0.25 - sweep / 360, to: 0.25 + sweep / 360)
+                .stroke(Parlour.ink.opacity(0.7), lineWidth: 1.2)
+                .frame(width: tickRadius * 2, height: tickRadius * 2)
+                .rotationEffect(.degrees(180))
+                .position(center)
+
+            // Ticks every 5 cents; heavier every 25
+            ForEach(Array(stride(from: -50, through: 50, by: 5)), id: \.self) { cent in
+                let isMajor = cent % 25 == 0
+                let length: CGFloat = isMajor ? radius * 0.11 : radius * 0.055
+                Rectangle()
+                    .fill(Parlour.ink.opacity(isMajor ? 0.9 : 0.6))
+                    .frame(width: isMajor ? 1.8 : 1, height: length)
+                    .offset(y: -tickRadius + length / 2)
+                    .rotationEffect(.degrees(Double(cent) / maxCents * sweep))
+                    .position(center)
+            }
+
+            // Numerals at the majors
+            ForEach([-50, -25, 0, 25, 50], id: \.self) { cent in
+                let angle = Double(cent) / maxCents * sweep * .pi / 180
+                let numeralRadius = radius * 0.70
+                Text(cent == 0 ? "0" : "\(abs(cent))")
+                    .font(.system(size: radius * 0.09, weight: .medium, design: .serif))
+                    .foregroundStyle(Parlour.ink)
+                    .position(
+                        x: center.x + numeralRadius * sin(angle),
+                        y: center.y - numeralRadius * cos(angle)
+                    )
+            }
+
+            // In-tune diamond at the top
+            Diamond()
+                .fill(isInTune ? Parlour.lampGreen : Parlour.ink.opacity(0.8))
+                .frame(width: radius * 0.05, height: radius * 0.08)
+                .position(x: center.x, y: center.y - radius * 0.945)
+        }
+    }
+
+    private func faceText(radius: CGFloat, center: CGPoint) -> some View {
+        ZStack {
+            Text("FLAT")
+                .font(.system(size: radius * 0.085, weight: .semibold, design: .serif).smallCaps())
+                .foregroundStyle(Parlour.inkFaint)
+                .position(x: center.x - radius * 0.52, y: center.y - radius * 0.28)
+            Text("SHARP")
+                .font(.system(size: radius * 0.085, weight: .semibold, design: .serif).smallCaps())
+                .foregroundStyle(Parlour.inkFaint)
+                .position(x: center.x + radius * 0.52, y: center.y - radius * 0.28)
+
+            // The sounded note, engraved large beneath the pivot
+            Text(hasPitch ? noteName : "—")
+                .font(.system(size: radius * 0.42, weight: .bold, design: .serif))
+                .foregroundStyle(Parlour.ink)
+                .shadow(color: .white.opacity(0.5), radius: 0.5, x: 0, y: 0.7)
+                .position(x: center.x, y: center.y + radius * 0.42)
+
+            // Frequency register window
+            Text(hasPitch ? String(format: "%.1f ᴴᶻ", frequency) : "· · ·")
+                .font(.system(size: radius * 0.085, weight: .medium, design: .serif))
+                .monospacedDigit()
+                .foregroundStyle(Parlour.ink.opacity(0.85))
+                .padding(.horizontal, radius * 0.07)
+                .padding(.vertical, radius * 0.025)
+                .background(
+                    RoundedRectangle(cornerRadius: 3)
+                        .fill(Parlour.parchmentShade.opacity(0.7))
+                        .overlay(RoundedRectangle(cornerRadius: 3).stroke(Parlour.ink.opacity(0.4), lineWidth: 0.8))
+                )
+                .position(x: center.x, y: center.y + radius * 0.73)
+
+            Text("CENTS OF A SEMITONE")
+                .font(.system(size: radius * 0.052, weight: .regular, design: .serif).smallCaps())
+                .foregroundStyle(Parlour.inkFaint)
+                .position(x: center.x, y: center.y - radius * 0.48)
+        }
+    }
+
+    private func needle(radius: CGFloat, center: CGPoint) -> some View {
+        NeedleShape()
+            .fill(
+                LinearGradient(
+                    colors: [Parlour.bluedSteel, Color(red: 0.30, green: 0.35, blue: 0.45), Parlour.bluedSteel],
+                    startPoint: .leading,
+                    endPoint: .trailing
+                )
+            )
+            .frame(width: radius * 0.045, height: radius * 0.86)
+            .offset(y: -radius * 0.36)
+            .rotationEffect(.degrees(needleAngle))
+            .position(center)
+            .shadow(color: .black.opacity(0.35), radius: 2, y: 2)
+            .animation(.spring(response: 0.35, dampingFraction: 0.7), value: needleAngle)
+    }
+
+    private func hub(center: CGPoint) -> some View {
+        ZStack {
+            Circle()
+                .fill(Parlour.bezelGradient)
+                .frame(width: 26, height: 26)
+                .overlay(Circle().stroke(Parlour.brassDark, lineWidth: 1))
+            Circle()
+                .fill(Parlour.bluedSteel)
+                .frame(width: 8, height: 8)
+        }
+        .position(center)
+        .shadow(color: .black.opacity(0.4), radius: 2, y: 1)
     }
 }
 
-struct TickMark: View {
-    let cent: Int
-    let maxCents: Double
-    let radius: CGFloat
-    
-    var body: some View {
-        let angle = (Double(cent) / maxCents) * 45 // degrees
-        let isMajor = cent % 50 == 0
-        let length = isMajor ? 16.0 : 8.0
-        let width = isMajor ? 2.0 : 1.0
-        let color = cent == 0 ? Color.white : Color.white.opacity(0.3)
-        
-        Rectangle()
-            .fill(color)
-            .frame(width: width, height: length)
-            .offset(y: -radius - length / 2)
-            .rotationEffect(.degrees(angle))
-    }
-}
-
-struct NeedleShape: Shape {
+struct Diamond: Shape {
     func path(in rect: CGRect) -> Path {
         var path = Path()
-        let width = rect.width
-        let height = rect.height
-        
-        path.move(to: CGPoint(x: width / 2, y: 0))
-        path.addLine(to: CGPoint(x: width / 2 - width / 2, y: height))
-        path.addLine(to: CGPoint(x: width / 2 + width / 2, y: height))
+        path.move(to: CGPoint(x: rect.midX, y: rect.minY))
+        path.addLine(to: CGPoint(x: rect.maxX, y: rect.midY))
+        path.addLine(to: CGPoint(x: rect.midX, y: rect.maxY))
+        path.addLine(to: CGPoint(x: rect.minX, y: rect.midY))
         path.closeSubpath()
-        
         return path
     }
 }
 
-/// String selector view
-struct StringSelectorView: View {
-    @Binding var selectedIndex: Int
-    let strings: [GuitarString]
-    let onSelect: (Int) -> Void
-    
-    var body: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 12) {
-                ForEach(Array(strings.enumerated()), id: \.element.id) { index, string in
-                    Button {
-                        onSelect(index)
-                    } label: {
-                        VStack(spacing: 4) {
-                            Text("\(string.stringNumber)")
-                                .font(.caption2)
-                                .foregroundStyle(.white.opacity(0.5))
-                            Text(string.note)
-                                .font(.title2.bold())
-                                .foregroundStyle(selectedIndex == index ? .white : .white.opacity(0.7))
-                            Text(String(format: "%.1f Hz", string.frequency))
-                                .font(.caption2.monospacedDigit())
-                                .foregroundStyle(.white.opacity(0.4))
-                        }
-                        .padding(.horizontal, 16)
-                        .padding(.vertical, 12)
-                        .background(
-                            RoundedRectangle(cornerRadius: 12)
-                                .fill(selectedIndex == index ? Color.white.opacity(0.15) : Color.white.opacity(0.05))
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: 12)
-                                        .stroke(selectedIndex == index ? Color.green.opacity(0.5) : Color.clear, lineWidth: 2)
-                                )
-                        )
-                    }
-                    .buttonStyle(.plain)
-                }
-            }
-            .padding(.horizontal)
-        }
+/// Tapered needle with a counterweight tail.
+struct NeedleShape: Shape {
+    func path(in rect: CGRect) -> Path {
+        var path = Path()
+        let w = rect.width
+        let h = rect.height
+        // Slim triangle: point at top, widening slightly toward the pivot
+        path.move(to: CGPoint(x: w / 2, y: 0))
+        path.addLine(to: CGPoint(x: w * 0.15, y: h * 0.82))
+        path.addLine(to: CGPoint(x: w * 0.85, y: h * 0.82))
+        path.closeSubpath()
+        // Counterweight tail below the pivot
+        path.addEllipse(in: CGRect(x: w * 0.1, y: h * 0.86, width: w * 0.8, height: w * 0.8))
+        return path
     }
 }
 
-/// Tuning preset picker
+// MARK: - String Indicators
+
+/// Six brass "tuning pegs", one per string. The peg matching the
+/// sounded string lights up of its own accord — no tapping required.
+struct StringPegsView: View {
+    let strings: [GuitarString]
+    let activeIndex: Int?
+    let isInTune: Bool
+
+    var body: some View {
+        HStack(spacing: 14) {
+            ForEach(Array(strings.enumerated()), id: \.element.id) { index, string in
+                let isActive = index == activeIndex
+                VStack(spacing: 5) {
+                    ZStack {
+                        Circle()
+                            .fill(Parlour.brassGradient)
+                            .overlay(
+                                Circle().stroke(
+                                    isActive
+                                        ? (isInTune ? Parlour.lampGreen : Parlour.brassBright)
+                                        : Parlour.brassDark,
+                                    lineWidth: isActive ? 2.5 : 1
+                                )
+                            )
+                            .shadow(
+                                color: isActive
+                                    ? (isInTune ? Parlour.lampGreen : Parlour.brassBright).opacity(0.8)
+                                    : .black.opacity(0.5),
+                                radius: isActive ? 8 : 2,
+                                y: isActive ? 0 : 2
+                            )
+                        Text(string.note)
+                            .font(.system(size: 19, weight: .bold, design: .serif))
+                            .foregroundStyle(isActive ? Parlour.ink : Parlour.ink.opacity(0.65))
+                            .shadow(color: Parlour.brassBright.opacity(0.6), radius: 0.5, y: 0.7)
+                    }
+                    .frame(width: 46, height: 46)
+                    .scaleEffect(isActive ? 1.12 : 1.0)
+
+                    Text(romanNumeral(string.stringNumber))
+                        .font(.system(size: 11, weight: .medium, design: .serif))
+                        .foregroundStyle(Parlour.brass.opacity(isActive ? 1 : 0.55))
+                }
+                .animation(.spring(response: 0.3, dampingFraction: 0.7), value: activeIndex)
+            }
+        }
+    }
+
+    private func romanNumeral(_ n: Int) -> String {
+        ["I", "II", "III", "IV", "V", "VI"][min(max(n - 1, 0), 5)]
+    }
+}
+
+// MARK: - Tuning Selector
+
 struct TuningPickerView: View {
     @Binding var selectedTuning: TuningPreset
-    
+
     var body: some View {
         Menu {
             ForEach(TuningPreset.allCases) { preset in
@@ -667,73 +862,134 @@ struct TuningPickerView: View {
         } label: {
             HStack(spacing: 8) {
                 Image(systemName: "tuningfork")
+                    .font(.system(size: 12))
                 Text(selectedTuning.rawValue)
-                    .font(.subheadline.weight(.medium))
+                    .font(.system(size: 13, weight: .semibold, design: .serif).smallCaps())
                 Image(systemName: "chevron.down")
-                    .font(.caption)
+                    .font(.system(size: 9, weight: .bold))
             }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 10)
+            .foregroundStyle(Parlour.brassBright)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 8)
             .background(
-                RoundedRectangle(cornerRadius: 10)
-                    .fill(Color.white.opacity(0.08))
+                RoundedRectangle(cornerRadius: 5)
+                    .fill(Parlour.mahoganyDark.opacity(0.75))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 5)
+                            .stroke(Parlour.brass.opacity(0.7), lineWidth: 1)
+                    )
             )
-            .foregroundStyle(.white)
         }
         .menuStyle(.borderlessButton)
+        .buttonStyle(.plain)
+        .fixedSize()
     }
 }
 
-/// Main tuner content view
+// MARK: - Listen Button
+
+/// A round brass push-button, as on an electric parlour bell.
+struct ListenButton: View {
+    let isListening: Bool
+    let isDisabled: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            VStack(spacing: 6) {
+                ZStack {
+                    Circle()
+                        .fill(Parlour.bezelGradient)
+                        .frame(width: 64, height: 64)
+                        .shadow(color: .black.opacity(0.6), radius: 6, y: 4)
+                    Circle()
+                        .fill(
+                            RadialGradient(
+                                colors: isListening
+                                    ? [Color(red: 0.75, green: 0.28, blue: 0.20), Color(red: 0.45, green: 0.13, blue: 0.09)]
+                                    : [Parlour.brassBright, Parlour.brass],
+                                center: .init(x: 0.35, y: 0.3),
+                                startRadius: 2,
+                                endRadius: 34
+                            )
+                        )
+                        .frame(width: 46, height: 46)
+                        .overlay(Circle().stroke(Parlour.brassDark, lineWidth: 1))
+                    Image(systemName: isListening ? "stop.fill" : "ear")
+                        .font(.system(size: 17, weight: .semibold))
+                        .foregroundStyle(isListening ? Parlour.parchment : Parlour.ink.opacity(0.8))
+                }
+                Text(isListening ? "SILENCE" : "LISTEN")
+                    .font(.system(size: 12, weight: .semibold, design: .serif).smallCaps())
+                    .tracking(2)
+                    .foregroundStyle(Parlour.brassBright)
+            }
+        }
+        .buttonStyle(.plain)
+        .disabled(isDisabled)
+        .opacity(isDisabled ? 0.5 : 1)
+    }
+}
+
+// MARK: - Main View
+
 struct TunerView: View {
     @StateObject private var viewModel = TunerViewModel()
-    
-    private let gradient = LinearGradient(
-        colors: [Color(hex: "#6C5CE7"), Color(hex: "#00CEC9")],
-        startPoint: .topLeading,
-        endPoint: .bottomTrailing
-    )
-    
+
     var body: some View {
         ZStack {
-            // Background
-            Color(hex: "#0F1020")
-                .overlay(gradient.opacity(0.1))
-                .ignoresSafeArea()
-            
-            VStack(spacing: 24) {
-                // Header
-                headerView
-                
-                // Tuning picker
+            MahoganyBackground()
+
+            VStack(spacing: 18) {
+                // Maker's plaque
+                BrassPlaque {
+                    VStack(spacing: 2) {
+                        Text("THE  PARLOUR  TUNER")
+                            .font(.system(size: 19, weight: .bold, design: .serif).smallCaps())
+                            .tracking(3)
+                        Text("Patent Chromatic Pitch Indicator · No. 6")
+                            .font(.system(size: 10, weight: .regular, design: .serif).italic())
+                            .tracking(1)
+                    }
+                    .foregroundStyle(Parlour.ink)
+                    .shadow(color: Parlour.brassBright.opacity(0.7), radius: 0.5, y: 0.8)
+                }
+
                 TuningPickerView(selectedTuning: $viewModel.selectedTuning)
-                
-                // String selector
-                StringSelectorView(
-                    selectedIndex: $viewModel.selectedStringIndex,
-                    strings: viewModel.strings,
-                    onSelect: viewModel.selectString
-                )
-                
-                // Main tuner dial
-                TunerDialView(
+
+                ParlourGaugeView(
                     centsOff: viewModel.centsOff,
+                    hasPitch: viewModel.hasPitch,
                     isInTune: viewModel.isInTune,
-                    targetNote: viewModel.currentString.note,
-                    detectedNote: viewModel.engine.closestNote,
-                    amplitude: viewModel.engine.amplitude
+                    noteName: viewModel.detectedString?.note ?? "—",
+                    frequency: viewModel.engine.detectedFrequency
                 )
-                .frame(maxWidth: 300, maxHeight: 300)
-                .padding(.vertical, 20)
-                
-                // Status indicators
-                statusView
-                
-                // Listen button
-                listenButton
-                
-                // Calibration
-                calibrationView
+                .frame(maxWidth: 340, maxHeight: 340)
+
+                // Instruction line, engraved on the cabinet
+                Text(viewModel.tuningAdvice)
+                    .font(.system(size: 15, weight: .medium, design: .serif).italic())
+                    .foregroundStyle(viewModel.isInTune ? Parlour.lampGreen : Parlour.brassBright.opacity(0.85))
+                    .animation(.easeInOut(duration: 0.2), value: viewModel.tuningAdvice)
+
+                StringPegsView(
+                    strings: viewModel.strings,
+                    activeIndex: viewModel.detectedStringIndex,
+                    isInTune: viewModel.isInTune
+                )
+
+                ListenButton(
+                    isListening: viewModel.isListening,
+                    isDisabled: viewModel.engine.state == .requestingPermission,
+                    action: viewModel.toggleListening
+                )
+
+                if case .error(let message) = viewModel.engine.state {
+                    Text(message)
+                        .font(.system(size: 12, design: .serif).italic())
+                        .foregroundStyle(Color(red: 0.85, green: 0.5, blue: 0.4))
+                        .multilineTextAlignment(.center)
+                }
             }
             .padding(24)
         }
@@ -741,160 +997,37 @@ struct TunerView: View {
             viewModel.engine.stopListening()
         }
     }
-    
-    private var headerView: some View {
-        HStack {
-            Image(systemName: "tuningfork")
-                .font(.system(size: 32))
-                .foregroundStyle(gradient)
-            VStack(alignment: .leading, spacing: 2) {
-                Text("GuitarTuner")
-                    .font(.title.bold())
-                    .foregroundStyle(.white)
-                Text("Precision Guitar Tuner")
-                    .font(.subheadline)
-                    .foregroundStyle(.white.opacity(0.6))
-            }
-            Spacer()
-        }
-    }
-    
-    private var statusView: some View {
-        HStack(spacing: 24) {
-            StatusItem(
-                label: "Frequency",
-                value: viewModel.engine.detectedFrequency > 0 ? 
-                    String(format: "%.1f Hz", viewModel.engine.detectedFrequency) : "--",
-                color: viewModel.engine.detectedFrequency > 0 ? .white : .white.opacity(0.4)
-            )
-            
-            StatusItem(
-                label: "Amplitude",
-                value: String(format: "%.3f", viewModel.engine.amplitude),
-                color: viewModel.engine.amplitude > 0.02 ? .green : .white.opacity(0.4)
-            )
-            
-            StatusItem(
-                label: "Status",
-                value: viewModel.engine.state == .listening ? "Listening" : "Idle",
-                color: viewModel.engine.state == .listening ? .green : .white.opacity(0.6)
-            )
-        }
-    }
-    
-    private var listenButton: some View {
-        Button {
-            viewModel.toggleListening()
-        } label: {
-            HStack(spacing: 12) {
-                Image(systemName: viewModel.isListening ? "stop.circle.fill" : "mic.circle.fill")
-                    .font(.system(size: 28))
-                Text(viewModel.isListening ? "Stop Listening" : "Start Listening")
-                    .font(.headline)
-            }
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 16)
-            .background(viewModel.isListening ? Color.red.opacity(0.8) : gradient)
-            .foregroundStyle(.white)
-            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-            .shadow(color: (viewModel.isListening ? Color.red : Color(hex: "#6C5CE7")).opacity(0.4), radius: 12, y: 6)
-        }
-        .buttonStyle(.plain)
-        .disabled(viewModel.engine.state == .requestingPermission)
-    }
-    
-    private var calibrationView: some View {
-        VStack(spacing: 8) {
-            Text("Calibration: A4 = \(Int(viewModel.calibration)) Hz")
-                .font(.caption)
-                .foregroundStyle(.white.opacity(0.6))
-            
-            Slider(value: $viewModel.calibration, in: 415...466, step: 1) { _ in
-                viewModel.setCalibration(viewModel.calibration)
-            }
-            .tint(gradient)
-            .padding(.horizontal, 40)
-        }
-    }
-}
-
-struct StatusItem: View {
-    let label: String
-    let value: String
-    let color: Color
-    
-    var body: some View {
-        VStack(spacing: 4) {
-            Text(label)
-                .font(.caption)
-                .foregroundStyle(.white.opacity(0.5))
-            Text(value)
-                .font(.system(.body, design: .monospaced))
-                .foregroundStyle(color)
-        }
-        .frame(maxWidth: .infinity)
-        .padding(.vertical, 12)
-        .background(RoundedRectangle(cornerRadius: 10).fill(Color.white.opacity(0.05)))
-    }
 }
 
 // MARK: - Previews
 
-#Preview("Tuner View - Light") {
+#Preview("Parlour Tuner") {
     TunerView()
-        .preferredColorScheme(.light)
 }
 
-#Preview("Tuner View - Dark") {
-    TunerView()
-        .preferredColorScheme(.dark)
+#Preview("Gauge — In Tune") {
+    ParlourGaugeView(centsOff: 1.5, hasPitch: true, isInTune: true, noteName: "A", frequency: 110.05)
+        .frame(width: 340, height: 340)
+        .padding()
+        .background(MahoganyBackground())
 }
 
-#Preview("String Selector") {
-    StringSelectorView(
-        selectedIndex: .constant(0),
-        strings: GuitarString.standardTuning,
-        onSelect: { _ in }
-    )
-    .padding()
-    .background(Color(hex: "#0F1020"))
+#Preview("Gauge — Sharp") {
+    ParlourGaugeView(centsOff: 28, hasPitch: true, isInTune: false, noteName: "E", frequency: 84.1)
+        .frame(width: 340, height: 340)
+        .padding()
+        .background(MahoganyBackground())
 }
 
-#Preview("Tuner Dial - In Tune") {
-    TunerDialView(
-        centsOff: 2,
-        isInTune: true,
-        targetNote: "E2",
-        detectedNote: "E2",
-        amplitude: 0.5
-    )
-    .frame(width: 300, height: 400)
-    .padding()
-    .background(Color(hex: "#0F1020"))
+#Preview("Gauge — Silent") {
+    ParlourGaugeView(centsOff: 0, hasPitch: false, isInTune: false, noteName: "—", frequency: 0)
+        .frame(width: 340, height: 340)
+        .padding()
+        .background(MahoganyBackground())
 }
 
-#Preview("Tuner Dial - Sharp") {
-    TunerDialView(
-        centsOff: 25,
-        isInTune: false,
-        targetNote: "A2",
-        detectedNote: "A#2",
-        amplitude: 0.3
-    )
-    .frame(width: 300, height: 400)
-    .padding()
-    .background(Color(hex: "#0F1020"))
-}
-
-#Preview("Tuner Dial - Flat") {
-    TunerDialView(
-        centsOff: -30,
-        isInTune: false,
-        targetNote: "D3",
-        detectedNote: "C#3",
-        amplitude: 0.4
-    )
-    .frame(width: 300, height: 400)
-    .padding()
-    .background(Color(hex: "#0F1020"))
+#Preview("String Pegs") {
+    StringPegsView(strings: GuitarString.standardTuning, activeIndex: 2, isInTune: false)
+        .padding()
+        .background(MahoganyBackground())
 }
