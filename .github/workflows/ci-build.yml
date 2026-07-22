@@ -52,7 +52,6 @@ jobs:
 
       - name: Generate Xcode project with Tuist
         run: |
-          cd GuitarTuner
           tuist generate
 
       - name: Set up code signing (when secrets are configured)
