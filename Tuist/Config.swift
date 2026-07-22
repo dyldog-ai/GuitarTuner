@@ -5,8 +5,8 @@ import ProjectDescription
 
 let config = Config(
     project: .tuist(
-        generationOptions: .options(
-            resolveDependenciesWithSystemScm: false
-        )
+        compatibleXcodeVersions: ">= 15.0",
+        swiftVersion: "5.9",
+        generationOptions: .options()
     )
 )
