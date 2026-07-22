@@ -47,21 +47,11 @@ jobs:
         run: xcodebuild -version
 
       - name: Install Tuist
-        env:
-          HOMEBREW_NO_AUTO_UPDATE: "1"
         run: |
-          export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
-          if command -v tuist &> /dev/null; then
-            echo "Tuist already installed: $(tuist version)"
-          else
-            curl -Ls https://install.tuist.io | bash
-            export PATH="$HOME/.tuist/bin:$PATH"
-            echo "Tuist installed: $(tuist version)"
-          fi
+          brew install tuist
 
       - name: Generate Xcode project with Tuist
         run: |
-          export PATH="$HOME/.tuist/bin:$PATH"
           cd GuitarTuner
           tuist generate
 
