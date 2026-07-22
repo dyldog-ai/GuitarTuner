@@ -6,13 +6,13 @@ import ProjectDescription
 let config = Config(
     compatibleXcodeVersions: ">= 15.0",
     swiftVersion: "5.9",
-    generationOptions: [
-        .enableNewBuildSystem,
-        .enableAutomaticXcodeSchemes,
-        .disableBundleAccessors
-    ],
+    generationOptions: .options(
+        enableNewBuildSystem: true,
+        enableAutomaticXcodeSchemes: true,
+        disableBundleAccessors: true
+    ),
     options: .options(
         allowStaticProductsToAccessBundle: true,
-        generateWorkSpace: true
+        generateWorkspace: true
     )
 )
